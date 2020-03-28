@@ -1,15 +1,11 @@
-.. tarantool documentation master file, created by
-   sphinx-quickstart on Sat Mar 28 11:54:36 2020.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
-
-Welcome to tarantool's documentation!
-=====================================
+Tarantool internals
+===================
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
+   fiber
 
 
 Indices and tables
