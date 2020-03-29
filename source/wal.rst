@@ -241,7 +241,7 @@ In summary we have:
     inside of main thread.
 
 Write data to WAL
------------------
+~~~~~~~~~~~~~~~~~
 
 When we need to issue a real write we allocate an journal entry
 which has a complete set of data to be written in a one pass.
@@ -406,10 +406,10 @@ In summary:
   - main thread runs ``tx_schedule_commit``.
 
 Transactions processing
-=======================
+-----------------------
 
 Transactions processing in 1.x series
--------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 In this series all transactions are processed in synchronous
 way. The journal entry carries no callbacks. We allocate the
@@ -524,7 +524,7 @@ pass the commit to engine or calls ``txn_rollback``
 to rollback the transaction on failure.
 
 Transactions processing in 2.x series
--------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The transaction processing in 2.x series is almost the same
 as in 1.x with one significant exception - journal writes
