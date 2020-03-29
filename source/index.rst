@@ -6,6 +6,7 @@ Tarantool internals
    :caption: Contents:
 
    fiber
+   replication
    wal
 
 
