@@ -1010,13 +1010,13 @@ By now we got partly familiar with the hierarchy of memory managers in
 **tarantool**. Described subsystems are explicitly organized, while
 **region** allocator and **matras** are standing a bit on the side.
 Basically, we have a number of functions, providing service on their
-level as following:\
-.[slab_map](#slab_map)\
-..[slab_get_with_order](#slab_get_with_order)\
-...[mempool_alloc](#mempool_alloc)\
-....[smalloc](#smalloc)\
-Or, alternatively\
-.[slab_get_large](#slab_get_large)\
+level as following:  
+.[slab_map](#slab_map)  
+..[slab_get_with_order](#slab_get_with_order)  
+...[mempool_alloc](#mempool_alloc)  
+....[smalloc](#smalloc)  
+Or, alternatively  
+.[slab_get_large](#slab_get_large)  
 ..[smalloc](#smalloc)
 
 While [smalloc](#smalloc) is only used for tuple allocation,
