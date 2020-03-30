@@ -873,4 +873,282 @@ we try to make a transition to become a regular one.
             }
         }
 
-Then we jump into ``applier_subscribe`` lifetyme cycle.
+Then we jump into ``applier_subscribe`` lifecycle.
+
+Applier lifecycle
+~~~~~~~~~~~~~~~~~
+
+Processing requests is implemented via ``applier_subscribe`` helper.
+
+.. code-block:: c
+
+    static void
+    applier_subscribe(struct applier *applier)
+    {
+        /* Send SUBSCRIBE request */
+        struct ev_io *coio = &applier->io;
+        struct ibuf *ibuf = &applier->ibuf;
+        struct xrow_header row;
+        struct tt_uuid cluster_id = uuid_nil;
+    
+        struct vclock vclock;
+        vclock_create(&vclock);
+        vclock_copy(&vclock, &replicaset.vclock);
+    
+        // Send subscribe command to the master node
+        uint32_t id_filter = box_is_orphan() ? 0 : 1 << instance_id;
+        xrow_encode_subscribe_xc(&row, &REPLICASET_UUID, &INSTANCE_UUID,
+                &vclock, replication_anon, id_filter);
+        coio_write_xrow(coio, &row);
+    
+        /* Read SUBSCRIBE response */
+        if (applier->version_id >= version_id(1, 6, 7)) {
+            coio_read_xrow(coio, ibuf, &row);
+            if (iproto_type_is_error(row.type)) {
+                xrow_decode_error_xc(&row);  /* error */
+            } else if (row.type != IPROTO_OK) {
+                tnt_raise(ClientError, ER_PROTOCOL,
+                        "Invalid response to SUBSCRIBE");
+            }
+            /*
+             * In case of successful subscribe, the server
+             * responds with its current vclock.
+             *
+             * Tarantool > 2.1.1 also sends its cluster id to
+             * the replica, and replica has to check whether
+             * its and master's cluster ids match.
+             */
+            vclock_create(&applier->remote_vclock_at_subscribe);
+            xrow_decode_subscribe_response_xc(&row, &cluster_id,
+                    &applier->remote_vclock_at_subscribe);
+            /*
+             * If master didn't send us its cluster id
+             * assume that it has done all the checks.
+             * In this case cluster_id will remain zero.
+             */
+            if (!tt_uuid_is_nil(&cluster_id) &&
+                !tt_uuid_is_equal(&cluster_id, &REPLICASET_UUID)) {
+                tnt_raise(ClientError, ER_REPLICASET_UUID_MISMATCH,
+                    tt_uuid_str(&cluster_id),
+                    tt_uuid_str(&REPLICASET_UUID));
+            }
+    
+            say_info("subscribed");
+            say_info("remote vclock %s local vclock %s",
+                vclock_to_string(&applier->remote_vclock_at_subscribe),
+                vclock_to_string(&vclock));
+        }
+        /*
+         * Tarantool < 1.6.7:
+         * If there is an error in subscribe, it's sent directly
+         * in response to subscribe.  If subscribe is successful,
+         * there is no "OK" response, but a stream of rows from
+         * the binary log.
+         */
+    
+        if (applier->state == APPLIER_READY) {
+            /*
+             * Tarantool < 1.7.7 does not send periodic heartbeat
+             * messages so we cannot enable applier synchronization
+             * for it without risking getting stuck in the 'orphan'
+             * mode until a DML operation happens on the master.
+             */
+            if (applier->version_id >= version_id(1, 7, 7))
+                applier_set_state(applier, APPLIER_SYNC);
+            else
+                applier_set_state(applier, APPLIER_FOLLOW);
+        } else {
+            /*
+             * Tarantool < 1.7.0 sends replica id during
+             * "subscribe" stage. We can't finish bootstrap
+             * until it is received.
+             */
+            assert(applier->state == APPLIER_FINAL_JOIN);
+            assert(applier->version_id < version_id(1, 7, 0));
+        }
+    
+        /* Re-enable warnings after successful execution of SUBSCRIBE */
+        applier->last_logged_errcode = 0;
+        if (applier->version_id >= version_id(1, 7, 4)) {
+            /* Enable replication ACKs for newer servers */
+            assert(applier->writer == NULL);
+    
+            char name[FIBER_NAME_MAX];
+            int pos = snprintf(name, sizeof(name), "applierw/");
+            uri_format(name + pos, sizeof(name) - pos, &applier->uri, false);
+    
+            applier->writer = fiber_new_xc(name, applier_writer_f);
+            fiber_set_joinable(applier->writer, true);
+            fiber_start(applier->writer, applier);
+        }
+    
+        applier->lag = TIMEOUT_INFINITY;
+        ...
+    }
+
+First we're trying to subscribe to the remote master node. On success
+we crate a writer fiber (which runs ``applier_writer_f``) fiber to
+send Acks to remote node upon we commit the data received.
+
+Then we enter applier lifecycle
+
+.. code-block:: c
+
+    static void
+    applier_subscribe(struct applier *applier)
+    {
+        ...
+        /* Register triggers to handle replication commits and rollbacks. */
+        struct trigger on_commit;
+        trigger_create(&on_commit, applier_on_commit, applier, NULL);
+        trigger_add(&replicaset.applier.on_commit, &on_commit);
+    
+        struct trigger on_rollback;
+        trigger_create(&on_rollback, applier_on_rollback, applier, NULL);
+        trigger_add(&replicaset.applier.on_rollback, &on_rollback);
+    
+        auto trigger_guard = make_scoped_guard([&] {
+            trigger_clear(&on_commit);
+            trigger_clear(&on_rollback);
+        });
+    
+        /*
+         * Process a stream of rows from the binary log.
+         */
+        while (true) {
+            if (applier->state == APPLIER_FINAL_JOIN &&
+                instance_id != REPLICA_ID_NIL) {
+                say_info("final data received");
+                applier_set_state(applier, APPLIER_JOINED);
+                applier_set_state(applier, APPLIER_READY);
+                applier_set_state(applier, APPLIER_FOLLOW);
+            }
+    
+            struct stailq rows;
+            applier_read_tx(applier, &rows);
+    
+            applier->last_row_time = ev_monotonic_now(loop());
+            /*
+             * In case of an heartbeat message wake a writer up
+             * and check applier state.
+             */
+            if (stailq_first_entry(&rows, struct applier_tx_row,
+                next)->row.lsn == 0)
+                fiber_cond_signal(&applier->writer_cond);
+            else if (applier_apply_tx(&rows) != 0)
+                diag_raise();
+        }
+    }
+
+Here we fetch data from remote node via ``applier_read_tx`` and collect
+it into ``rows`` queue. Then call ``applier_apply_tx`` to process it
+locally (we will back to it). The trigger ``applier_on_commit`` notifies
+the writer fiber to send Ack to the remote node. In turn trigger
+``applier_on_rollback`` is a bit more complex
+
+.. code-block:: c
+
+    static int
+    applier_on_rollback(struct trigger *trigger, void *event)
+    {
+        struct applier *applier = (struct applier *)trigger->data;
+        /* Setup a shared error. */
+        if (!diag_is_empty(&replicaset.applier.diag)) {
+            diag_add_error(&applier->diag,
+                diag_last_error(&replicaset.applier.diag));
+        }
+        /* Stop the applier fiber. */
+        fiber_cancel(applier->reader);
+        return 0;
+    }
+
+It runs when something gone wrong when we've been processing the
+transaction. We move the error shared between all appliers in
+``replicaset.applier.diag``. This is toplevel diag instance. Each
+applier has own diag entry as well. We will dive into this moment
+a bit later. So we put a reference from ``replicaset.applier.diag``
+error to the failing applier diag instace and stop the applier.
+
+Main processing of the transaction takes place in
+
+.. code-block:: c
+
+    static int
+    applier_apply_tx(struct stailq *rows)
+    {
+        ...
+        struct txn *txn = txn_begin();
+        struct applier_tx_row *item;
+        ...
+        stailq_foreach_entry(item, rows, next) {
+            // process data in engine (box_process_rw)
+            int res = apply_row(row);
+            ...
+            if (res != 0)
+                goto rollback;
+        }
+        ...
+        struct trigger *on_rollback, *on_commit;
+        on_rollback = region_alloc(&txn->region, ...);
+        on_commit = region_alloc(&txn->region, ...);
+
+        trigger_create(on_rollback, applier_txn_rollback_cb, ...);
+        txn_on_rollback(txn, on_rollback);
+    
+        trigger_create(on_commit, applier_txn_commit_cb, ...);
+        txn_on_commit(txn, on_commit);
+    
+        // Write transaction to WAL
+        if (txn_commit_async(txn) < 0)
+            goto fail;
+    
+        vclock_follow(&replicaset.applier.vclock,
+            first_row->replica_id, first_row->lsn);
+        ...
+        return 0;
+    rollback:
+        txn_rollback(txn);
+    fail:
+        ...
+        return -1;
+    }
+
+First we try to commit request into engine without writting to
+the WAL. If it passes fine we create two triggers -
+``applier_txn_commit_cb`` to notify linked triggers that
+transaction passed (in our case it means we trigger toplevel
+``applier_on_commit`` and applier writer fiber notifies the
+master node that transaction has been successfully completed),
+and ``applier_txn_rollback_cb`` to rollback the commit.
+
+The ``applier_txn_rollback_cb`` is a bit tricky. It sets
+error to the current fiber and moves it to the replicaset
+instance.
+
+.. code-block:: c
+
+    static int
+    applier_txn_rollback_cb(struct trigger *trigger, void *event)
+    {
+        (void) trigger;
+
+        /* Setup shared applier diagnostic area. */
+        diag_set(ClientError, ER_WAL_IO);
+        diag_move(&fiber()->diag, &replicaset.applier.diag);
+
+        /* Broadcast the rollback event across all appliers. */
+        trigger_run(&replicaset.applier.on_rollback, event);
+
+        /* Rollback applier vclock to the committed one. */
+        vclock_copy(&replicaset.applier.vclock, &replicaset.vclock);
+        return 0;
+    }
+
+Then we run chained ``on_rollback`` which is basically
+``applier_txn_rollback_cb`` set earlier.
+
+Once transaction is prepared we call ``txn_commit_async`` to write
+it into WAL. The write is done in asynchronous manner which means
+it simply queued but not written immediately. Because of this
+the triggers were allocated dynamically since we can't use
+stack space for deferred writes.
