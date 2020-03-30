@@ -8,6 +8,7 @@ Tarantool internals
    fiber
    replication
    wal
+   allocators
 
 
 Indices and tables
