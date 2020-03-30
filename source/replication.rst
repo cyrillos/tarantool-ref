@@ -692,7 +692,7 @@ The initialization starts with ``box_cfg_xc``.
 
 .. code-block:: c
 
-    box_cfg_xc
+    box_cfg_xc(void)
         ...
         // prepare replicaset
         replication_init();
@@ -701,11 +701,14 @@ The initialization starts with ``box_cfg_xc``.
 
 The ``box_set_replication_anon`` serves anonymous replications.
 Most important part here is that this code is called by two places:
-from cold start of tarantool and when ``box.cfg{}``} is triggered manually
-(from interactive console or script). Thus if previously the node has
-been in anonymous replication mode (where we only fetch fresh data from
-remote master machine) and become a normal replica we have to reset
-all previous appliers and reconnect to a master.
+from the cold start of tarantool and when ``box.cfg{}``} is triggered
+manually (from interactive console or script).
+
+Thus if previously the node has been an anonymous replica (where we only
+fetch fresh data from the remote master machine) and wanna be a normal
+replica then we have to reset all previous appliers and reconnect
+to a master. In turn it implies that previously we've finished bootup
+with anonymous replication and we have some appliers running.
 
 .. code-block:: c
 
@@ -743,16 +746,15 @@ all previous appliers and reconnect to a master.
                 " has finished");
         } 
 
-Again, this code takes place only if normal bootup already processed
-and we've reconfigured the tarantool instance in runtime. Any error at
-this stage will cause tarantool to exit.
+On a cold start if we gonna be an anonymous replica we just remember the
+setting in `replication_anon`. Then we continue bootstrap procesure
+(we don't consider local recovery for simplicity sake).
 
-Then we continue bootstrap procesure (we don't consider local recovery
-to be short). First we're trying to reify appliers
+First we're trying to reify appliers.
 
 .. code-block:: c
 
-    bootstrap
+    bootstrap()
         ...
         box_sync_replication(true);
             appliers = cfg_get_replication(&count);
@@ -770,8 +772,105 @@ to be short). First we're trying to reify appliers
 
 We connect to remote machines (if quorum is not fit we just leave
 the box in read only state) and register replicas in global replicas
-hash. If there some old appliers were running we clean them up.
+hash. If there some old appliers were running we clean them up. This
+is similar to 1.10 series. If something goes wrong we trigger an
+exception.
 
 Then we continue bootstrap either from remote master node or as
-a cluster leader. These procedures are similar to 1.10 series. Though
-with one significant difference - anonymous replication.
+a cluster leader.
+
+Bootstrap first replica
+~~~~~~~~~~~~~~~~~~~~~~~
+
+This process is similar to 1.10 series - we register our node
+``replica_id`` in ``_cluster`` internal service space together
+with other replicas. Then replicaset is registered in the
+``_schema`` space.
+
+Bootstrap from a cluster leader
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Booting up from cluster leader a bit differs from 1.10 due to
+anonymous replication (the master node is obtained by
+``replicaset_leader``)
+
+.. code-block:: c
+
+    static void
+    bootstrap_from_master(struct replica *master)
+    {
+        applier = master->applier;
+    
+        // Wait the applier becom ready
+        applier_resume_to_state(applier, APPLIER_READY, TIMEOUT_INFINITY);
+        
+        // Either join a cluster or
+        // fetch the snapshot.
+        wait_state = replication_anon ?
+            APPLIER_FETCH_SNAPSHOT :
+            APPLIER_INITIAL_JOIN;
+        applier_resume_to_state(applier, wait_state, TIMEOUT_INFINITY);
+    
+        /*
+         * Process initial data (snapshot or dirty disk data).
+         */
+        engine_begin_initial_recovery_xc(NULL);
+        wait_state = replication_anon ?
+            APPLIER_FETCHED_SNAPSHOT :
+            APPLIER_FINAL_JOIN;
+        applier_resume_to_state(applier, wait_state, TIMEOUT_INFINITY);
+    
+        /*
+         * Process final data (WALs).
+         */
+        engine_begin_final_recovery_xc();
+        recovery_journal_create(&replicaset.vclock);
+    
+        if (!replication_anon) {
+            applier_resume_to_state(applier, APPLIER_JOINED,
+                TIMEOUT_INFINITY);
+        }
+    
+        /* Finalize the new replica */
+        engine_end_recovery_xc();
+    
+        /* Switch applier to initial state */
+        applier_resume_to_state(applier, APPLIER_READY, TIMEOUT_INFINITY);
+        ...
+    }
+
+An interesting moment here is if we boot as an anonymous replica: instead
+of joining master we wait the applier (ie ``applier_f``) to fetch a snapshot
+of data from remote master node. Same time if we've been an anonymous replica
+we try to make a transition to become a regular one.
+
+.. code-block:: c
+
+    static int
+    applier_f(va_list ap)
+        ...
+        while (!fiber_is_cancelled()) {
+            try {
+                // Connect to remote peers
+                applier_connect(applier);
+                if (tt_uuid_is_nil(&REPLICASET_UUID)) {
+                    // Either join to cluster or
+                    // just fetch a data snapshot
+                    if (replication_anon)
+                        applier_fetch_snapshot(applier);
+                    else
+                        applier_join(applier);
+                }
+                if (instance_id == REPLICA_ID_NIL &&
+                    !replication_anon) {
+                    // We've been an anonymous replica
+                    // and become a normal one
+                    applier_register(applier);
+                }
+                applier_subscribe(applier);
+            } catch() {
+                ...
+            }
+        }
+
+Then we jump into ``applier_subscribe`` lifetyme cycle.
