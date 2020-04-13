@@ -377,9 +377,9 @@ by ``bootstrap_from_master`` routine which is quite nontrivial.
         applier_resume_to_state(applier, APPLIER_FINAL_JOIN);
 
 One of the key moment here is ``applier_resume_to_state`` helper calls.
-As you remember the appliers are bound to replica instance and they all were
-in ``APPLIER_CONNECTED`` state when we entered this routine, iow they
-are paused waiting for a kick.
+As you remember the appliers are bound to replica instance and they all
+were in ``APPLIER_CONNECTED`` state when we entered this routine, iow
+they are paused waiting for a kick.
 
 .. code-block:: c
 
@@ -397,7 +397,8 @@ The first one is new ``applier_on_state_f`` and second is
 ``replica_on_applier_state_f``. The triggers are running in the sequence
 above but neet to mention than ``applier_on_state_f`` is one time trigger,
 once fired it get cleaned up while ``replica_on_applier_state_f`` is premanent.
-And to refresh memory these triggers are running from ``applier_f: applier_set_state``.
+And to refresh memory these triggers are running from
+``applier_f: applier_set_state``.
 
 The ``applier_resume_to_state`` kicks the applier of a chosen leader.
 This fiber tries to pass authentification (if provided in config) and become
@@ -971,7 +972,6 @@ Processing requests is implemented via ``applier_subscribe`` helper.
         applier->last_logged_errcode = 0;
         if (applier->version_id >= version_id(1, 7, 4)) {
             /* Enable replication ACKs for newer servers */
-            assert(applier->writer == NULL);
     
             char name[FIBER_NAME_MAX];
             int pos = snprintf(name, sizeof(name), "applierw/");
@@ -1043,7 +1043,7 @@ Then we enter applier lifecycle
 Here we fetch data from remote node via ``applier_read_tx`` and collect
 it into ``rows`` queue. Then call ``applier_apply_tx`` to process it
 locally (we will back to it). The trigger ``applier_on_commit`` notifies
-the writer fiber to send Ack to the remote node. In turn trigger
+the writer fiber to send Ack to the remote node. In turn the trigger
 ``applier_on_rollback`` is a bit more complex
 
 .. code-block:: c
@@ -1152,3 +1152,58 @@ it into WAL. The write is done in asynchronous manner which means
 it simply queued but not written immediately. Because of this
 the triggers were allocated dynamically since we can't use
 stack space for deferred writes.
+
+The transaction itself bound to journal entry thus the caller
+fiber no longer linked with it. The calling fiber simply goes
+into next iteration and waits for data to receive from remote
+node.
+
+The WAL engine will commit the transaction by self independently
+of the applier fiber. An interesting moment here is how we rollback
+the transaction if something went wrong. The core function here is
+
+.. code-block:: c
+
+    static void
+    txn_complete(struct txn *txn)
+    {
+        if (txn->signature < 0) {
+            /* Undo the transaction. */
+            struct txn_stmt *stmt;
+            stailq_reverse(&txn->stmts);
+            stailq_foreach_entry(stmt, &txn->stmts, next)
+                txn_rollback_one_stmt(txn, stmt);
+            if (txn->engine)
+                engine_rollback(txn->engine, txn);
+            if (txn_has_flag(txn, TXN_HAS_TRIGGERS))
+                txn_run_rollback_triggers(txn, &txn->on_rollback);
+        ...
+        }
+    }
+
+When we run ``txn_run_rollback_triggers`` we call the linked
+trigger ``applier_txn_rollback_cb``
+
+.. code-block:: c
+
+    static int
+    applier_txn_rollback_cb(struct trigger *trigger, void *event)
+    {
+        (void) trigger;
+        /* Setup shared applier diagnostic area. */
+        diag_set(ClientError, ER_WAL_IO);
+        diag_move(&fiber()->diag, &replicaset.applier.diag);
+    
+        /* Broadcast the rollback event across all appliers. */
+        trigger_run(&replicaset.applier.on_rollback, event);
+    
+        /* Rollback applier vclock to the committed one. */
+        vclock_copy(&replicaset.applier.vclock, &replicaset.vclock);
+        return 0;
+    }
+
+We move move error into shared ``replicaset.applier.diag`` clearing
+current fiber's diag state and run ``replicaset.applier.on_rollback``
+which runs a linked ``applier_on_rollback`` been shown earlier.
+It fetches last error from ``relicaset`` instance, sets it to the
+current fiber, then stops the applier fiber.
