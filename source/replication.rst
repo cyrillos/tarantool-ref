@@ -1122,7 +1122,7 @@ master node that transaction has been successfully completed),
 and ``applier_txn_rollback_cb`` to rollback the commit.
 
 The ``applier_txn_rollback_cb`` is a bit tricky. It sets
-error to the current fiber and moves it to the replicaset
+error to the current fiber and copies it to the replicaset
 instance.
 
 .. code-block:: c
@@ -1134,7 +1134,8 @@ instance.
 
         /* Setup shared applier diagnostic area. */
         diag_set(ClientError, ER_WAL_IO);
-        diag_move(&fiber()->diag, &replicaset.applier.diag);
+        diag_set_error(&replicaset.applier.diag,
+                       diag_last_error(diag_get()));
 
         /* Broadcast the rollback event across all appliers. */
         trigger_run(&replicaset.applier.on_rollback, event);
@@ -1182,28 +1183,9 @@ the transaction if something went wrong. The core function here is
     }
 
 When we run ``txn_run_rollback_triggers`` we call the linked
-trigger ``applier_txn_rollback_cb``
-
-.. code-block:: c
-
-    static int
-    applier_txn_rollback_cb(struct trigger *trigger, void *event)
-    {
-        (void) trigger;
-        /* Setup shared applier diagnostic area. */
-        diag_set(ClientError, ER_WAL_IO);
-        diag_move(&fiber()->diag, &replicaset.applier.diag);
-    
-        /* Broadcast the rollback event across all appliers. */
-        trigger_run(&replicaset.applier.on_rollback, event);
-    
-        /* Rollback applier vclock to the committed one. */
-        vclock_copy(&replicaset.applier.vclock, &replicaset.vclock);
-        return 0;
-    }
-
-We move move error into shared ``replicaset.applier.diag`` clearing
-current fiber's diag state and run ``replicaset.applier.on_rollback``
-which runs a linked ``applier_on_rollback`` been shown earlier.
-It fetches last error from ``relicaset`` instance, sets it to the
-current fiber, then stops the applier fiber.
+trigger ``applier_txn_rollback_cb`` mentioned recently where
+we copy error into shared ``replicaset.applier.diag`` and
+run ``replicaset.applier.on_rollback``, which in turn calls a
+linked ``applier_on_rollback``. This fetches last error from
+``relicaset`` instance, sets it to the current applier and
+then stops the applier fiber.
