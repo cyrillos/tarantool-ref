@@ -7,6 +7,7 @@ Tarantool internals
 
    fiber
    replication
+   relay
    wal
    allocators
 
