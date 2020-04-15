@@ -126,10 +126,233 @@ Then we continue joining procedure
         row.sync = header->sync;
         coio_write_xrow(io, &row);
 
-        // The WAL range (start_vclock; stop_vclock)
+        // The WAL range (start_vclock; stop_vclock) with rows
         relay_final_join(io->fd, header->sync, &start_vclock, &stop_vclock);
+
+        // End of WAL marker
+        xrow_encode_vclock_xc(&row, &replicaset.vclock);
+        row.sync = header->sync;
+        coio_write_xrow(io, &row);
+
+        // Advance the consumer position
+        gc_consumer_advance(gc, &stop_vclock);
 
 We fetch master's node vclock (the ``replicaset.vclock`` is updated
 by WAL engine upon on commit when data is already written to the storage)
-and send it out and start sending the vlock range from ``start_vclock``
-to ``stop_vclock`` together with rows bound to the range.
+and send it out. Then we send the vlock range from ``start_vclock``
+to ``stop_vclock`` together with rows bound to the range and end it
+sending end of WAL marker.
+
+The ``relay_final_join`` is a bit tricky
+
+.. code-block:: c
+
+    void
+    relay_final_join(int fd, uint64_t sync, struct vclock *start_vclock,
+                     struct vclock *stop_vclock)
+    {
+        struct relay *relay = relay_new(NULL);
+
+        relay_start(relay, fd, sync, relay_send_row);
+        auto relay_guard = make_scoped_guard([=] {
+            relay_stop(relay);
+            relay_delete(relay);
+        });
+
+        relay->r = recovery_new(cfg_gets("wal_dir"), false,
+                                start_vclock);
+        vclock_copy(&relay->stop_vclock, stop_vclock);
+
+        int rc = cord_costart(&relay->cord, "final_join",
+                              relay_final_join_f, relay);
+        if (rc == 0)
+            rc = cord_cojoin(&relay->cord);
+        if (rc != 0)
+            diag_raise();
+    }
+
+It runs ``relay_final_join_f`` in a separate thread waiting for
+its completion. This function runs ``recover_remaining_wals``
+which scans the WAL files (they can rotate) for rows associated
+with ``{start_vclock; stop_vclock}`` range and send them all to
+the remote peer.
+
+After this stage our node is joined and we need to wait for
+subscribe request from remote peer. Once received we prepare
+our node to send local updates to the peer.
+
+.. code-block:: c
+
+    static void
+    tx_process_replication(struct cmsg *m)
+    {
+        ...
+        switch (msg->header.type) {
+        ...
+        case IPROTO_SUBSCRIBE:
+            box_process_subscribe(&io, &msg->header);
+            break;
+        ...
+
+The ``box_process_subscribe`` never returns but rather watches
+for local changes and sends them up.
+
+.. code-block:: c
+
+    void
+    box_process_subscribe(struct ev_io *io, struct xrow_header *header)
+    {
+        ...
+        // Fetch vclock of the remote peer
+        vclock_create(&replica_clock);
+        xrow_decode_subscribe_xc(header, NULL, &replica_uuid, &replica_clock,
+                                 &replica_version_id, &anon, &id_filter);
+        ...
+        //
+        // Remember current WAL clock
+        vclock_create(&vclock);
+        vclock_copy(&vclock, &replicaset.vclock);
+
+        // Send it to the peer
+        struct xrow_header row;
+        xrow_encode_subscribe_response_xc(&row, &REPLICASET_UUID, &vclock);
+
+        // Set 0 component to ours 0 component value
+        vclock_reset(&replica_clock, 0, vclock_get(&replicaset.vclock, 0));
+
+        // Initiate subscription procedure
+        relay_subscribe(replica, io->fd, header->sync, &replica_clock,
+                        replica_version_id, id_filter);
+    }
+
+Everything should be clear from code comments except dropping
+0th component. FIXME: describe why 0th component is so important.
+
+The subscription routine runs until explicitly cancelled
+
+.. code-block:: c
+
+    void
+    relay_subscribe(struct replica *replica, int fd, uint64_t sync,
+                    struct vclock *replica_clock, uint32_t replica_version_id,
+                    uint32_t replica_id_filter)
+    {
+        struct relay *relay = replica->relay;
+        relay_start(relay, fd, sync, relay_send_row);
+        ...
+
+        vclock_copy(&relay->local_vclock_at_subscribe, &replicaset.vclock);
+        relay->r = recovery_new(cfg_gets("wal_dir"), false, replica_clock);
+        vclock_copy(&relay->tx.vclock, replica_clock);
+        ...
+        int rc = cord_costart(&relay->cord, "subscribe",
+                              relay_subscribe_f, relay);
+        if (rc == 0)
+            rc = cord_cojoin(&relay->cord);
+        ...
+    }
+
+The ``relay->r = recovery_new`` provides us access to the WAL files
+while ``relay_subscribe_f`` runs inside a separate thread.
+
+.. code-block:: c
+
+    static int
+    relay_subscribe_f(va_list ap)
+    {
+        struct relay *relay = va_arg(ap, struct relay *);
+        struct recovery *r = relay->r;
+
+        coio_enable();
+        relay_set_cord_name(relay->io.fd);
+
+        /* Create cpipe to tx for propagating vclock. */
+        cbus_endpoint_create(&relay->endpoint,
+                tt_sprintf("relay_%p", relay),
+                fiber_schedule_cb, fiber());
+        cbus_pair("tx", relay->endpoint.name, &relay->tx_pipe,
+                  &relay->relay_pipe, NULL, NULL, cbus_process);
+        ...
+
+        /* Setup WAL watcher for sending new rows to the replica. */
+        wal_set_watcher(&relay->wal_watcher, relay->endpoint.name,
+                        relay_process_wal_event, cbus_process);
+
+        /* Start fiber for receiving replica acks. */
+        char name[FIBER_NAME_MAX];
+        snprintf(name, sizeof(name), "%s:%s", fiber()->name, "reader");
+        struct fiber *reader = fiber_new_xc(name, relay_reader_f);
+        fiber_set_joinable(reader, true);
+        fiber_start(reader, relay, fiber());
+
+        /*
+         * If the replica happens to be up to date on subscribe,
+         * don't wait for timeout to happen - send a heartbeat
+         * message right away to update the replication lag as
+         * soon as possible.
+         */
+        relay_send_heartbeat(relay);
+
+        /*
+         * Run the event loop until the connection is broken
+         * or an error occurs.
+         */
+        while (!fiber_is_cancelled()) {
+            double timeout = replication_timeout;
+            fiber_cond_wait_deadline(&relay->reader_cond,
+                                     relay->last_row_time + timeout);
+
+            /*
+             * The fiber can be woken by IO cancel, by a timeout of
+             * status messaging or by an acknowledge to status message.
+             * Handle cbus messages first.
+             */
+            cbus_process(&relay->endpoint);
+
+            /* Check for a heartbeat timeout. */
+            if (ev_monotonic_now(loop()) - relay->last_row_time > timeout)
+                relay_send_heartbeat(relay);
+
+            /*
+             * Check that the vclock has been updated and the previous
+             * status message is delivered
+             */
+            if (relay->status_msg.msg.route != NULL)
+                continue;
+
+            struct vclock *send_vclock;
+            if (relay->version_id < version_id(1, 7, 4))
+                send_vclock = &r->vclock;
+            else
+                send_vclock = &relay->recv_vclock;
+            if (vclock_sum(&relay->status_msg.vclock) == vclock_sum(send_vclock))
+                continue;
+
+            static const struct cmsg_hop route[] = {
+                {tx_status_update, NULL}
+            };
+
+            cmsg_init(&relay->status_msg.msg, route);
+            vclock_copy(&relay->status_msg.vclock, send_vclock);
+            relay->status_msg.relay = relay;
+            cpipe_push(&relay->tx_pipe, &relay->status_msg.msg);
+
+            /* Collect xlog files received by the replica. */
+            relay_schedule_pending_gc(relay, send_vclock);
+        }
+        ...
+    }
+
+First we create ``cbus`` transport to the ``tx`` net thread
+so that we could notify it where we have data to send out.
+
+Then we setup a watcher on WAL changes. On every new commit
+the ``relay_process_wal_event`` will be called which calls
+the ``recover_remaining_wals`` helper to advance xlog cursor
+in the WAL file. Once new record comes in the relay get
+notified via ``relay->wal_watcher``.
+
+The reader of new Acks coming from remote node implemened
+via ``relay_reader_f`` fiber. The one of the key moment
+is that all replicas are sending heartbeat messages each
+other pointing that they are alive.
