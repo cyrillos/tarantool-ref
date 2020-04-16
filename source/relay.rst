@@ -292,31 +292,51 @@ while ``relay_subscribe_f`` runs inside a separate thread.
          * soon as possible.
          */
         relay_send_heartbeat(relay);
+        ...
+    }
 
-        /*
-         * Run the event loop until the connection is broken
-         * or an error occurs.
-         */
+First we create ``relay->endpoint`` endpoint and pair it with
+``tx`` endpoint (the ``tx`` endpoint comes from net thread
+spinning inside ``net_cord_f``). Once paired we will have
+``relay->tx_pipe`` which responsible to notify ``tx`` thread
+to send out the data we provide, and ``relay->relay_pipe``
+which notifies relay thread from ``tx`` thread side.
+
+Then we setup a watcher on WAL changes. On every new commit
+the ``relay_process_wal_event`` will be called which calls
+the ``recover_remaining_wals`` helper to advance xlog cursor
+in the WAL file and send new rows to the remote replica.
+
+The reader of new Acks coming from remote node is implemened
+via ``relay_reader_f`` fiber. The one of the key moment is
+that all replicas are sending heartbeat messages each other
+pointing that they are alive.
+
+Rely lifecycle
+--------------
+
+.. code-block:: c
+
+    static int
+    relay_subscribe_f(va_list ap)
+    {
+        ...
         while (!fiber_is_cancelled()) {
+            //
+            // Wait for incoming data from remote
+            // peer (it is Ack/Heartbeat message)
             double timeout = replication_timeout;
             fiber_cond_wait_deadline(&relay->reader_cond,
                                      relay->last_row_time + timeout);
-
-            /*
-             * The fiber can be woken by IO cancel, by a timeout of
-             * status messaging or by an acknowledge to status message.
-             * Handle cbus messages first.
-             */
-            cbus_process(&relay->endpoint);
-
-            /* Check for a heartbeat timeout. */
+            ...
+            //
+            // Send the heartbeat packet if needed
             if (ev_monotonic_now(loop()) - relay->last_row_time > timeout)
                 relay_send_heartbeat(relay);
 
-            /*
-             * Check that the vclock has been updated and the previous
-             * status message is delivered
-             */
+            //
+            // Make sure that vlock has been updated
+            // and the previous status is delievered.
             if (relay->status_msg.msg.route != NULL)
                 continue;
 
@@ -325,6 +345,8 @@ while ``relay_subscribe_f`` runs inside a separate thread.
                 send_vclock = &r->vclock;
             else
                 send_vclock = &relay->recv_vclock;
+            //
+            // Nothing to do
             if (vclock_sum(&relay->status_msg.vclock) == vclock_sum(send_vclock))
                 continue;
 
@@ -343,16 +365,13 @@ while ``relay_subscribe_f`` runs inside a separate thread.
         ...
     }
 
-First we create ``cbus`` transport to the ``tx`` net thread
-so that we could notify it where we have data to send out.
+As expected we wait for heartbeat packet from remote peer first
+(the ``relay_reader_f`` will wake us up via ``relay->reader_cond``).
+Then we send our own heartbeat message if needed. And finally
+we send the last received vclock from the remote peer. Same
+time we notify xlog engine about wal files we no longer need
+since they are propagated.
 
-Then we setup a watcher on WAL changes. On every new commit
-the ``relay_process_wal_event`` will be called which calls
-the ``recover_remaining_wals`` helper to advance xlog cursor
-in the WAL file. Once new record comes in the relay get
-notified via ``relay->wal_watcher``.
-
-The reader of new Acks coming from remote node implemened
-via ``relay_reader_f`` fiber. The one of the key moment
-is that all replicas are sending heartbeat messages each
-other pointing that they are alive.
+Note that WAL commits runs ``relay_process_wal_event`` by
+self, still the even is delivered to main event loop and then
+to the relay thread.
