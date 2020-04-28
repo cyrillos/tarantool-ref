@@ -18,7 +18,7 @@ Relay start up
 --------------
 
 When remote node connects to us it passes ``IPROTO_JOIN`` code
-via network message (the full process about message exchnage
+via network message (the full process about message exchange
 is described in replication section)
 
 .. code-block:: c
@@ -61,7 +61,7 @@ First we start the joining procedure
         ...
 
 Here we test if replica has rights to join the cluster, make sure that
-the WAL is enabled and register the concumer. The consumers makes sure
+the WAL is enabled and register the consumer. The consumers makes sure
 that WAL file is not rotated while there are some records which are not
 yet propagated to the whole cluster.
 
@@ -98,7 +98,7 @@ Then  we create the relay instance itself
             engine_join_xc(&ctx, &relay->stream);
 
 The ``relay_send_initial_join_row`` creates new relay structure then
-prepares datat to be sent to the remote replica. First we get a read view
+prepares data to be sent to the remote replica. First we get a read view
 from engine, then check that there is rollback in progress in WAL engine
 and fetch the latest vclock from it. Then we encode the tuples which
 are matched the WAL record and send them out to remote replica.
@@ -228,7 +228,7 @@ for local changes and sends them up.
 Everything should be clear from code comments except dropping
 0th component. FIXME: describe why 0th component is so important.
 
-The subscription routine runs until explicitly cancelled
+The subscription routine runs until explicitly canceled
 
 .. code-block:: c
 
@@ -307,12 +307,12 @@ the ``relay_process_wal_event`` will be called which calls
 the ``recover_remaining_wals`` helper to advance xlog cursor
 in the WAL file and send new rows to the remote replica.
 
-The reader of new Acks coming from remote node is implemened
+The reader of new Acks coming from remote node is implemented
 via ``relay_reader_f`` fiber. The one of the key moment is
 that all replicas are sending heartbeat messages each other
 pointing that they are alive.
 
-Rely lifecycle
+Relay lifecycle
 --------------
 
 .. code-block:: c
