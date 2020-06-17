@@ -9,6 +9,7 @@ Tarantool internals
    replication
    relay
    wal
+   wal-fmt
    allocators
 
 
