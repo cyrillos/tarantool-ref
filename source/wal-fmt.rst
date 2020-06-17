@@ -109,8 +109,8 @@ The ``len`` value stores the number of bytes occupied by xrow headers
 with data. If xrows are compressed we should read ``len`` bytes and
 decompress them.
 
-Decompressed stream consists of xrow header plus xrow data pairs. Header
-represented as
+Decompressed stream consists of xrow header plus xrow data pairs.
+Header represented as
 
 .. code-block:: c
 
@@ -128,3 +128,104 @@ represented as
         struct iovec    body[XROW_BODY_IOVMAX];
     };
 
+Each ``xrow_header`` describes the ``body`` data, ie the requests to be
+executed (like insert, update and etc). Note that ``xlog_fixheader::len``
+may cover not one ``xrow_header`` but a series of headers and xrow requests.
+
+Tarantool provides a ``tarantoolctl`` tool to show the content of files
+in a human readable form.
+
+.. code-block:: shell
+
+    $./src/tarantool ./extra/dist/tarantoolctl cat --show-system ../dumper/examples/00000000000000000008.snap
+    ---
+    HEADER:
+      timestamp: 1592050034.6865
+      type: INSERT
+    BODY:
+      space_id: 272
+      tuple: ['cluster', '442100e0-b90f-4d5b-92d7-98ad52ed4919']
+    ---
+    HEADER:
+      lsn: 1
+      type: INSERT
+      timestamp: 1592050034.6865
+    BODY:
+      space_id: 272
+      tuple: ['max_id', 512]
+    ...
+    HEADER:
+      lsn: 517
+      type: INSERT
+      timestamp: 1592050034.6865
+    BODY:
+      space_id: 512
+      tuple: [2, 'Scorpions', 2015]
+    ---
+    HEADER:
+      lsn: 518
+      type: INSERT
+      timestamp: 1592050034.6865
+    BODY:
+      space_id: 512
+      tuple: [3, 'Ace of Base', 1993]
+
+Another example is more detailed example for same file
+
+.. code-block:: shell
+
+    $ /ttdump examples/00000000000000000008.snap
+
+    meta: 'SNAP'
+    meta: '0.13'
+    meta: 'Version: 2.5.0-136-gef86e3c99'
+    meta: 'Instance: 123a579d-4994-4e7c-a52f-6b576a8988d7'
+    meta: 'VClock: {1: 8}'
+    fixed header
+    -------
+      magic 0xba0bbad5 crc32p 0 crc32c 0x66db6462 len 6055
+    -------
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 0 tm 1.592e+09 tsn 0 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 55
+    -------
+    key: 0x10 'space id' value: 272
+    key: 0x21 'tuple' value: {cluster, 442100e0-b90f-4d5b-92d7-98ad52ed4919}
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 1 tm 1.592e+09 tsn 1 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 19
+    -------
+    key: 0x10 'space id' value: 272
+    key: 0x21 'tuple' value: {max_id, 512}
+    ...
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 515 tm 1.592e+09 tsn 515 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 48
+    -------
+    key: 0x10 'space id' value: 320
+    key: 0x21 'tuple' value: {1, 123a579d-4994-4e7c-a52f-6b576a8988d7}
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 516 tm 1.592e+09 tsn 516 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 21
+    -------
+    key: 0x10 'space id' value: 512
+    key: 0x21 'tuple' value: {1, Roxette, 1986}
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 517 tm 1.592e+09 tsn 517 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 23
+    -------
+    key: 0x10 'space id' value: 512
+    key: 0x21 'tuple' value: {2, Scorpions, 2015}
+    xrow header
+    -------
+      type 0x2 (INSERT) replica_id 0 group_id 0 sync 0 lsn 518 tm 1.592e+09 tsn 518 is_commit 1 bodycnt 1 schema_version 0x4027e6
+        iov: len 25
+    -------
+    key: 0x10 'space id' value: 512
+    key: 0x21 'tuple' value: {3, Ace of Base, 1993}
+    -------
