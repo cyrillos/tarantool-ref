@@ -313,7 +313,7 @@ that all replicas are sending heartbeat messages each other
 pointing that they are alive.
 
 Relay lifecycle
---------------
+---------------
 
 .. code-block:: c
 
