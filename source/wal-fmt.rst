@@ -52,3 +52,24 @@ is ``\n`` separated records. The block is started with obligatory ``signature``,
 
  Note the double ``\n\n`` formed by last entry and ``PrevVClock`` entry.
  This represents the end of meta information block.
+
+Data blocks (xrows)
+-------------------
+
+The meta block carries only service information about content of the
+WAL file. The real data appended into the WAL file in xrows records.
+Structure of each record is the following
+
++--------------+
+| fixed header |
++--------------+
+| xrows header |
++--------------+
+|  xrows data  |
++--------------+
+| xrows header |
++--------------+
+|  xrows data  |
++--------------+
+|     ...      |
++--------------+
